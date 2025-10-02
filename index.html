@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>녹음 · 역재생 웹앱</title>
+<style>
+  :root { --fg:#111; --bg:#fafafa; --muted:#666; --accent:#2b7; }
+  *{box-sizing:border-box}
+  body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple SD Gothic Neo, "Noto Sans KR", sans-serif;
+       margin:0; padding:24px; background:var(--bg); color:var(--fg)}
+  h1{font-size:20px; margin:0 0 12px 0}
+  .app{max-width:680px; margin:0 auto; background:#fff; border-radius:16px; box-shadow:0 6px 24px rgba(0,0,0,.08); padding:20px}
+  .row{display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px}
+  button{appearance:none; border:0; background:#111; color:#fff; padding:12px 14px; border-radius:12px; font-weight:600; cursor:pointer}
+  button.secondary{background:#e9e9e9; color:#111}
+  button.ghost{background:transparent; color:#111; border:2px solid #111}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  .status{font-size:14px; color:var(--muted)}
+  .meter{width:100%; height:10px; background:#f3f3f3; border-radius:8px; overflow:hidden; margin:8px 0 12px}
+  .bar{height:100%; width:0%; background:linear-gradient(90deg, #2bb673, #2b7); transition:width .08s linear}
+  audio{width:100%}
+  .footer{font-size:12px; color:#888; margin-top:14px}
+</style>
+</head>
+<body>
+  <div class="app">
+    <h1>🎙️ 녹음 · 재생 · <span style="color:#2bb673">역재생</span></h1>
+    <div class="row">
+      <button id="btnRec">● 녹음 시작</button>
+      <button id="btnStop" disabled>■ 정지</button>
+      <button id="btnPlay" disabled>▶ 재생</button>
+      <button id="btnPlayRev" disabled>◀ 역재생</button>
+    </div>
+    <div class="meter"><div id="bar" class="bar"></div></div>
+    <div class="row">
+      <button id="btnDL" class="secondary" disabled>⬇ 원본 다운로드</button>
+      <button id="btnDLRev" class="secondary" disabled>⬇ 역재생 파일 다운로드</button>
+    </div>
+    <audio id="player" controls preload="metadata"></audio>
+    <div class="status" id="status">대기 중</div>
+    <div class="footer">마이크 권한을 허용하세요. 녹음 후 재생/역재생과 파일 저장이 가능합니다.</div>
+  </div>
+
+<script>
+(() => {
+  const $ = sel => document.querySelector(sel);
+  const btnRec = $('#btnRec');
+  const btnStop = $('#btnStop');
+  const btnPlay = $('#btnPlay');
+  const btnPlayRev = $('#btnPlayRev');
+  const btnDL = $('#btnDL');
+  const btnDLRev = $('#btnDLRev');
+  const status = $('#status');
+  const bar = $('#bar');
+  const player = $('#player');
+
+  let mediaRecorder;
+  let audioChunks = [];
+  let stream;
+  let originalBlob = null;
+  let originalUrl = null;
+  let reversedWavBlob = null;
+  let reversedUrl = null;
+
+  // Simple level meter using AnalyserNode
+  let audioCtx, analyser, srcNode, rafId;
+  const startMeter = (s) => {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    srcNode = audioCtx.createMediaStreamSource(s);
+    srcNode.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      analyser.getByteTimeDomainData(data);
+      // Compute rough RMS
+      let sum = 0;
+      for (let i=0;i<data.length;i++){
+        const v = (data[i]-128)/128;
+        sum += v*v;
+      }
+      const rms = Math.sqrt(sum/data.length);
+      const pct = Math.min(100, Math.max(0, (rms*180)));
+      bar.style.width = pct + '%';
+      rafId = requestAnimationFrame(tick);
+    };
+    tick();
+  };
+  const stopMeter = () => {
+    cancelAnimationFrame(rafId);
+    bar.style.width = '0%';
+    if (audioCtx) audioCtx.close();
+    audioCtx = analyser = srcNode = null;
+  };
+
+  function setStatus(t){ status.textContent = t; }
+  function setBusyUI(isRec){
+    btnRec.disabled = isRec;
+    btnStop.disabled = !isRec;
+    btnPlay.disabled = !originalBlob;
+    btnPlayRev.disabled = !reversedWavBlob;
+    btnDL.disabled = !originalBlob;
+    btnDLRev.disabled = !reversedWavBlob;
+  }
+
+  async function ensureStream(){
+    if (!stream){
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    return stream;
+  }
+
+  btnRec.addEventListener('click', async () => {
+    try{
+      await ensureStream();
+      audioChunks = [];
+      mediaRecorder = new MediaRecorder(stream, { mimeType: (MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : undefined) });
+      mediaRecorder.ondataavailable = (e)=>{ if (e.data && e.data.size) audioChunks.push(e.data); };
+      mediaRecorder.onstop = async () => {
+        stopMeter();
+        originalBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        if (originalUrl) URL.revokeObjectURL(originalUrl);
+        originalUrl = URL.createObjectURL(originalBlob);
+        player.src = originalUrl;
+        btnDL.onclick = () => downloadBlob(originalBlob, dateStamp() + '_original.' + (mediaRecorder.mimeType?.includes('webm')?'webm':'ogg'));
+
+        // Prepare reversed WAV in background (synchronously here after stop)
+        setStatus('처리 중… (역재생 파일 생성)');
+        try{
+          reversedWavBlob = await makeReversedWav(originalBlob);
+          if (reversedUrl) URL.revokeObjectURL(reversedUrl);
+          reversedUrl = URL.createObjectURL(reversedWavBlob);
+          btnDLRev.onclick = () => downloadBlob(reversedWavBlob, dateStamp() + '_reversed.wav');
+          btnPlayRev.disabled = false;
+          btnDLRev.disabled = false;
+          setStatus('완료! 재생/역재생 가능합니다.');
+        }catch(err){
+          console.error(err);
+          setStatus('역재생 파일 생성 실패: ' + err.message);
+        }
+        setBusyUI(false);
+      };
+      mediaRecorder.start();
+      startMeter(stream);
+      setStatus('녹음 중… 정지 버튼을 누르세요.');
+      setBusyUI(true);
+    }catch(err){
+      console.error(err);
+      alert('마이크 접근 실패: ' + err.message);
+      setStatus('마이크 접근 실패');
+    }
+  });
+
+  btnStop.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive'){
+      mediaRecorder.stop();
+      setStatus('처리 중…');
+    }
+  });
+
+  btnPlay.addEventListener('click', () => {
+    if (originalUrl){
+      player.src = originalUrl;
+      player.play();
+    }
+  });
+
+  btnPlayRev.addEventListener('click', async () => {
+    if (reversedUrl){
+      player.src = reversedUrl;
+      await player.play();
+    }
+  });
+
+  function downloadBlob(blob, filename){
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 100);
+  }
+
+  function dateStamp(){
+    const d = new Date();
+    const pad = n=>String(n).padStart(2,'0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  }
+
+  async function blobToAudioBuffer(blob){
+    const arrayBuf = await blob.arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0)); // clone for Safari
+    await ctx.close();
+    return audioBuf;
+  }
+
+  function reverseAudioBuffer(buf){
+    // Clone and reverse per channel
+    const numCh = buf.numberOfChannels;
+    const sampleRate = buf.sampleRate;
+    const len = buf.length;
+    const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(numCh, len, sampleRate);
+    // Make a new buffer & fill reversed data
+    const out = ctx.createBuffer(numCh, len, sampleRate);
+    for (let ch=0; ch<numCh; ch++){
+      const data = buf.getChannelData(ch);
+      const rev = out.getChannelData(ch);
+      for (let i=0, j=len-1; i<len; i++, j--){
+        rev[i] = data[j];
+      }
+    }
+    return out;
+  }
+
+  async function renderToWavBlob(buf){
+    // No processing, just encode buffer to WAV
+    const wav = audioBufferToWav(buf);
+    return new Blob([wav], { type: 'audio/wav' });
+  }
+
+  async function makeReversedWav(blob){
+    const audioBuf = await blobToAudioBuffer(blob);
+    const reversed = reverseAudioBuffer(audioBuf);
+    return await renderToWavBlob(reversed);
+  }
+
+  // AudioBuffer to WAV (16-bit PCM)
+  // Based on standard RIFF/WAVE header construction
+  function audioBufferToWav(buffer) {
+    const numCh = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const format = 1; // PCM
+    const bitDepth = 16;
+
+    let result;
+    if (numCh === 2) {
+      result = interleave(buffer.getChannelData(0), buffer.getChannelData(1));
+    } else if (numCh === 1) {
+      result = buffer.getChannelData(0);
+    } else {
+      // Mixdown to stereo (first two channels) or mono (first) as fallback
+      const left = buffer.getChannelData(0);
+      const right = buffer.getChannelData(1) || buffer.getChannelData(0);
+      result = interleave(left, right);
+    }
+
+    return encodeWAV(result, format, sampleRate, numCh, bitDepth);
+  }
+
+  function interleave(left, right) {
+    const length = left.length + right.length;
+    const result = new Float32Array(length);
+    let index = 0, inputIndex = 0;
+    while (index < length) {
+      result[index++] = left[inputIndex];
+      result[index++] = right[inputIndex];
+      inputIndex++;
+    }
+    return result;
+  }
+
+  function floatTo16BitPCM(output, offset, input){
+    for (let i = 0; i < input.length; i++, offset+=2){
+      let s = Math.max(-1, Math.min(1, input[i]));
+      s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      output.setInt16(offset, s, true);
+    }
+  }
+
+  function writeString(view, offset, string){
+    for (let i = 0; i < string.length; i++){
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+
+  function encodeWAV(samples, format, sampleRate, numChannels, bitDepth){
+    const bytesPerSample = bitDepth / 8;
+    const blockAlign = numChannels * bytesPerSample;
+    const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
+    const view = new DataView(buffer);
+
+    /* RIFF identifier */
+    writeString(view, 0, 'RIFF');
+    /* RIFF chunk length */
+    view.setUint32(4, 36 + samples.length * bytesPerSample, true);
+    /* RIFF type */
+    writeString(view, 8, 'WAVE');
+    /* format chunk identifier */
+    writeString(view, 12, 'fmt ');
+    /* format chunk length */
+    view.setUint32(16, 16, true);
+    /* sample format (raw) */
+    view.setUint16(20, format, true);
+    /* channel count */
+    view.setUint16(22, numChannels, true);
+    /* sample rate */
+    view.setUint32(24, sampleRate, true);
+    /* byte rate (sample rate * block align) */
+    view.setUint32(28, sampleRate * blockAlign, true);
+    /* block align (channel count * bytes per sample) */
+    view.setUint16(32, blockAlign, true);
+    /* bits per sample */
+    view.setUint16(34, bitDepth, true);
+    /* data chunk identifier */
+    writeString(view, 36, 'data');
+    /* data chunk length */
+    view.setUint32(40, samples.length * bytesPerSample, true);
+    /* data */
+    floatTo16BitPCM(view, 44, samples);
+
+    return view;
+  }
+
+})();</script>
+</body>
+</html>
